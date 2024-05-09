@@ -18,7 +18,6 @@ from typing import (
     TypeVar,
     Union,
 )
-from async_timeout import timeout
 
 import grpc
 from grpc.aio import (
@@ -31,6 +30,7 @@ from grpc.aio import (
 )
 from grpc.aio._typing import RequestType, RequestIterableType, ResponseType, ResponseIterableType
 
+from .errors import grpc_exception_handler, match_grpc_error
 from .grpc_api import rpc_pb2, rpc_pb2_grpc
 from .grpc_api import v3lock_pb2, v3lock_pb2_grpc
 from .types import (
@@ -39,6 +39,8 @@ from .types import (
     TransactionRequest, TxnReturnType, TxnReturnValues, WatchCreateRequestFilterType,
     WatchEvent, WatchEventType,
 )
+
+
 __all__ = (
     'EtcdClient',
     'EtcdCommunicator',
@@ -57,7 +59,7 @@ class Proto(Protocol[T]):
 class EtcdAuthInterceptor:
     token: str
 
-    def __init__(self, token):
+    def __init__(self, token) -> None:
         self.token = token
 
     def build_details(self, orig_details: ClientCallDetails) -> ClientCallDetails:
@@ -189,7 +191,7 @@ class EtcdClient:
                 return communicator
         return P()
 
-    def connect(self):
+    def connect(self) -> EtcdConnectionManager:
         """
         Async context manager which establishes connection to Etcd cluster.
 
@@ -200,7 +202,12 @@ class EtcdClient:
         """
         return EtcdConnectionManager(self._build_connector_protocol())
 
-    def with_lock(self, lock_name: str, timeout: Optional[float] = None, ttl: Optional[int] = None):
+    def with_lock(
+        self,
+        lock_name: str,
+        timeout: Optional[float] = None,
+        ttl: Optional[int] = None,
+    ) -> EtcdConnectionManager:
         """
         Async context manager which establishes connection and then
         immediately tries to acquire lock with given lock name.
@@ -481,7 +488,11 @@ class EtcdCommunicator:
     encoding: str
     channel: Channel
 
-    def __init__(self, channel: Channel, encoding: str = 'utf-8'):
+    def __init__(
+        self,
+        channel: Channel,
+        encoding: str = 'utf-8',
+    ) -> None:
         """
         Creates `EtcdCommunicator` instance.
         In most cases, users won't have to directly create `EtcdCommunicator` class;
@@ -510,6 +521,7 @@ class EtcdCommunicator:
         )
         return response.token
 
+    @grpc_exception_handler
     async def put(
         self, key: str, value: Optional[str],
         lease: Optional[int] = None,
@@ -560,6 +572,7 @@ class EtcdCommunicator:
             return response.prev_kv.value.decode(encoding)
         return None
 
+    @grpc_exception_handler
     async def get(
         self, key: str,
         max_create_revision: Optional[str] = None,
@@ -625,6 +638,7 @@ class EtcdCommunicator:
         else:
             return None
 
+    @grpc_exception_handler
     async def get_prefix(
         self, key: str,
         max_create_revision: Optional[str] = None,
@@ -697,6 +711,7 @@ class EtcdCommunicator:
             ret[x.key.decode(encoding)] = x.value.decode(encoding)
         return ret
 
+    @grpc_exception_handler
     async def get_range(
         self, key: str, range_end: str,
         limit: Optional[str] = None,
@@ -772,6 +787,7 @@ class EtcdCommunicator:
             ret[x.key.decode(encoding)] = x.value.decode(encoding)
         return ret
 
+    @grpc_exception_handler
     async def delete(
         self, key: str,
         prev_kv: bool = False, encoding: Optional[str] = None,
@@ -809,6 +825,7 @@ class EtcdCommunicator:
         else:
             return None
 
+    @grpc_exception_handler
     async def delete_prefix(
         self, key: str,
         prev_kv: bool = False, encoding: Optional[str] = None,
@@ -849,6 +866,7 @@ class EtcdCommunicator:
         else:
             return None
 
+    @grpc_exception_handler
     async def delete_range(
         self, key: str, range_end: str,
         prev_kv: bool = False, encoding: Optional[str] = None,
@@ -892,6 +910,7 @@ class EtcdCommunicator:
         else:
             return None
 
+    @grpc_exception_handler
     async def keys_prefix(
         self, key: str,
         max_create_revision: Optional[str] = None,
@@ -960,6 +979,7 @@ class EtcdCommunicator:
         )
         return [x.key.decode(encoding) for x in response.kvs]
 
+    @grpc_exception_handler
     async def keys_range(
         self, key: str, range_end: str,
         limit: Optional[str] = None,
@@ -1033,6 +1053,7 @@ class EtcdCommunicator:
         )
         return [x.key.decode(encoding) for x in response.kvs]
 
+    @grpc_exception_handler
     async def grant_lease(self, ttl: int, id: Optional[int] = None) -> int:
         """
         Creates a lease which expires if the server does not receive a keepAlive
@@ -1056,7 +1077,8 @@ class EtcdCommunicator:
         response = await stub.LeaseGrant(rpc_pb2.LeaseGrantRequest(ID=id or 0, TTL=ttl))
         return response.ID
 
-    async def revoke_lease(self, id: int):
+    @grpc_exception_handler
+    async def revoke_lease(self, id: int) -> None:
         """
         Revokes a lease. All keys attached to the lease will expire and be deleted.
 
@@ -1083,6 +1105,8 @@ class EtcdCommunicator:
         -------
         task: asyncio.Task
         """
+
+        @grpc_exception_handler
         async def _task_worker():
             stub = rpc_pb2_grpc.LeaseStub(self.channel)
 
@@ -1130,9 +1154,9 @@ class EtcdCommunicator:
             request.create_request.watch_id = str(watch_id)
 
         stream = stub.Watch()
-        await stream.write(request)
 
         try:
+            await stream.write(request)
             if ready_event is not None:
                 ready_event.set()
             while True:
@@ -1153,6 +1177,8 @@ class EtcdCommunicator:
                         prev_value,
                         event_type,
                     )
+        except grpc.aio.AioRpcError as e:
+            raise match_grpc_error(e) from e
         finally:
             if watch_id is not None and not stream.done():
                 request = rpc_pb2.WatchRequest()
@@ -1294,6 +1320,7 @@ class EtcdCommunicator:
             start_revision=start_revision, watch_id=watch_id,
         )
 
+    @grpc_exception_handler
     async def txn(
         self,
         txn_builder: Callable[[EtcdTransactionAction], None],
@@ -1337,6 +1364,7 @@ class EtcdCommunicator:
         )
         return results
 
+    @grpc_exception_handler
     async def txn_compare(
         self,
         compares: List[rpc_pb2.Compare],  # type: ignore
@@ -1405,7 +1433,7 @@ class EtcdTransaction:
     success: EtcdTransactionAction
     failure: EtcdTransactionAction
 
-    def __init__(self, channel: Channel, encoding: str = 'utf-8'):
+    def __init__(self, channel: Channel, encoding: str = 'utf-8') -> None:
         self.encoding = encoding
         self.channel = channel
 
@@ -1416,7 +1444,7 @@ class EtcdTransaction:
         self,
         compares: List[rpc_pb2.Compare],  # type: ignore
         encoding: Optional[str] = None,
-    ):
+    ) -> TxnReturnType:
         """
         Executes Txn and returns results.
         """
@@ -1454,7 +1482,7 @@ class EtcdTransaction:
                 ret.append(None)  # TODO: Handle delete response
             else:
                 ret.append(None)
-        return ret, result.succeeded
+        return TxnReturnType(ret, result.succeeded)
 
 
 class EtcdTransactionAction:
@@ -1466,11 +1494,11 @@ class EtcdTransactionAction:
 
     callback: Optional[Callable[[bool], None]] = None
 
-    def __init__(self, encoding: str = 'utf-8'):
+    def __init__(self, encoding: str = 'utf-8') -> None:
         self.requests = []
         self.encoding = encoding
 
-    def add_callback(self, cb: Optional[Callable[[bool], None]]):
+    def add_callback(self, cb: Optional[Callable[[bool], None]]) -> None:
         self.callback = cb
 
     def put(
@@ -1479,7 +1507,7 @@ class EtcdTransactionAction:
         ignore_value: bool = False,
         ignore_lease: bool = False,
         encoding: Optional[str] = None,
-    ):
+    ) -> None:
         """
         Puts given key into the key-value store.
         """
@@ -1505,7 +1533,7 @@ class EtcdTransactionAction:
         sort_order: RangeRequestSortOrder = RangeRequestSortOrder.NONE,
         sort_target: RangeRequestSortTarget = RangeRequestSortTarget.KEY,
         encoding: Optional[str] = None,
-    ):
+    ) -> None:
         """
         Gets the keys in the range from the key-value store.
         """
@@ -1527,7 +1555,7 @@ class EtcdTransactionAction:
             ),
         )
 
-    def delete(self, key: str, encoding: Optional[str] = None):
+    def delete(self, key: str, encoding: Optional[str] = None) -> None:
         """
         Deletes the given range from the key-value store.
         A delete request increments the revision of the key-value store
@@ -1579,13 +1607,16 @@ class EtcdLockManager:
         stub = v3lock_pb2_grpc.LockStub(self.channel)
         if self.ttl is not None:
             communicator = EtcdCommunicator(self.channel, encoding=self.encoding)
-            self._lease_id = await communicator.grant_lease(self.ttl)
+            _lease_id = await communicator.grant_lease(self.ttl)
+            self._lease_id = _lease_id
             self._keepalive_task = communicator.create_lease_keepalive_task(
-                self._lease_id, self.ttl / 10)
+                _lease_id,
+                self.ttl / 10,
+            )
         else:
             self._lease_id = None
         try:
-            async with timeout(self.timeout_seconds):
+            async with asyncio.timeout(self.timeout_seconds):
                 response = await stub.Lock(
                     v3lock_pb2.LockRequest(
                         name=self.name.encode(self.encoding),
@@ -1594,12 +1625,6 @@ class EtcdLockManager:
                 )
             self._lock_id = response.key.decode(self.encoding)
         except asyncio.TimeoutError:
-            if self._keepalive_task is not None:
-                self._keepalive_task.cancel()
-                try:
-                    await self._keepalive_task
-                except asyncio.CancelledError:
-                    pass
             if self._lease_id is not None:
                 try:
                     await communicator.revoke_lease(self._lease_id)
@@ -1607,14 +1632,13 @@ class EtcdLockManager:
                     if e.code() != grpc.StatusCode.NOT_FOUND:
                         raise e
             raise
-        except:
+        finally:
             if self._keepalive_task is not None:
                 self._keepalive_task.cancel()
                 try:
                     await self._keepalive_task
                 except asyncio.CancelledError:
                     pass
-            raise
 
     async def __aexit__(self, exc_type, exc, tb) -> Optional[bool]:
         """
